@@ -1,0 +1,13 @@
+[project]
+name = "humanoid-motion-recon"
+version = "0.1.0"
+description = "Monocular video -> world-frame humanoid skeletons + meshes (SAM-3D-Body + VGGT-Omega + rigid fitting)"
+requires-python = ">=3.10"
+dependencies = ["numpy", "torch", "pillow", "imageio"]
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["humanoid_motion_recon"]
