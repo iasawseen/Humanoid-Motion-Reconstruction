@@ -90,6 +90,31 @@ advisory (dark floors never confirm heels).
 QA videos: `videos/input/<name>.mp4` and `videos/output/<scenario>/*.mp4`. Renderers write
 wherever `MR_OUT` points; move keepers here.
 
+## NVIDIA soma-retargeter bridge (fit -> SOMA BVH -> Unitree G1 CSV)
+
+Two modules bridge to [NVIDIA/soma-retargeter](https://github.com/NVIDIA/soma-retargeter)
+(SOMA BVH -> G1 29-DOF CSV via Newton/Warp IK; needs its own py3.12 env and a checkout at
+`../soma-retargeter` or `SOMA_RETARGETER_DIR`):
+
+```bash
+MR_OUT=<fitdir> python -m humanoid_motion_recon.export_soma_bvh out.bvh   # fit -> SOMA BVH
+# run their converter (their env): python app/bvh_to_csv_converter.py --config ... --viewer null
+python -m humanoid_motion_recon.import_soma_csv out.csv qpos.csv          # CSV -> 36-col qpos
+```
+
+`export_soma_bvh` copies the template hierarchy verbatim from a sample BVH in their checkout
+and calibrates all anatomy conventions from that sample's standing reference frame (spine /
+hip-line directions in the Hips/Chest local frames, the mid-hip to Hips-joint offset — the
+SOMA Hips joint sits ~8.5 cm above the hip line, and conflating them inflates the skeleton
+~9% and makes the retargeter crouch — and natural local rotations for untracked joints).
+Scale + floor are self-measured from the fit. **Chirality**: fit3d articulation carries
+SAM's smoothed-in mirror flickers; for flicker-prone clips pass `MR_MOCAP_NPZ` (npz with
+chirality-corrected `mocap` [N,58,3] + `ok`, e.g. from a hypothesis-selection + Viterbi
+pass) or the retargeted robot pivots ~180 deg on mirrored stretches. `import_soma_csv`
+undoes their "Mujoco"-facing world convention (BVH +Z forward lands on -Y; we yaw it back
+to +X) and converts cm/degrees to m/radians (their extrinsic-xyz root euler, G1 DOF order
+identical to the g1.xml hinge order).
+
 ## Visualization / QA renderers
 
 All torch-CUDA (no OpenGL): `collate_video` (4-pane: overlay | depth | skeleton-over-cloud |
