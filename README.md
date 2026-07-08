@@ -77,7 +77,12 @@ fit-measured and propagated to both. Validated: cross-resolution (512/448) stabl
 fit converge (each pass re-levels the residual). Auto's +X convention is the subject's
 true dominant facing, which can differ from hand-pinned `MR_YAW` conventions - compare
 across conventions with `bench/quality_gate.py --align-yaw`. Individual env vars still
-override single windows.
+override single windows. Validated on a second scenario (5 s walking-only clip, dark
+studio, tracking camera, different robot) with zero manual windows: straight-line pelvis
+path (straightness 1.00), height flat to 0.7 cm, facing = walk direction within 4 deg,
+heels on floor to +-1 cm. Walking clips exercise the stance-side gates: uprightness is
+scored on the more-extended (stance) leg, and the heel depth-band visibility guard is
+advisory (dark floors never confirm heels).
 
 ## Videos
 

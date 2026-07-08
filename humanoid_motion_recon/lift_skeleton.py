@@ -162,19 +162,24 @@ def main():
              + np.linalg.norm(rel3[:, ki[side + "kne"]] - rel3[:, ki[side + "ank"]], axis=1)
              + np.linalg.norm(rel3[:, ki[side + "ank"]] - rel3[:, ki[side + "heel"]], axis=1))
         return np.linalg.norm(rel3[:, ki[side + "hip"]] - rel3[:, ki[side + "heel"]], axis=1) /             np.maximum(L, 1e-6)
-    ext = 0.5 * (_ext("l") + _ext("r"))
+    # STANCE-side geometry: during walking only the stance leg is straight and planted, so
+    # per-frame we score the more-extended side (mean-of-sides has no upright frames at all
+    # on walking-only clips; mid-heel alignment likewise breaks during stride).
+    ext_l, ext_r = _ext("l"), _ext("r")
+    ext = np.maximum(ext_l, ext_r)
+    stance_side = np.where(ext_l >= ext_r, ki["lheel"], ki["rheel"])
     # straight legs are NOT enough: the subject bends at the hips with straight legs (rack
     # work), which tilts the torso while ext stays high. Standing straight means torso
-    # anti-parallel to the legs - frame-internal, no gravity needed.
+    # anti-parallel to the (stance) leg - frame-internal, no gravity needed.
     torso3 = rel3[:, ki["neck"]]
-    legdir3 = 0.5 * (rel3[:, ki["lheel"]] + rel3[:, ki["rheel"]])
+    legdir3 = rel3[np.arange(N), stance_side]
     align = -np.einsum("ni,ni->n", torso3, legdir3) / np.maximum(
         np.linalg.norm(torso3, axis=1) * np.linalg.norm(legdir3, axis=1), 1e-9)
     vel = np.full(N, np.nan)
     dv = np.linalg.norm(np.diff(rel3, axis=0), axis=2)   # [N-1, K]
     vel[1:] = np.nanmedian(dv, axis=1) * FPS
     e95 = np.nanpercentile(ext, 95)
-    upright = (ext > 0.92 * e95) & (align > 0.93)        # straight legs AND unbent torso
+    upright = (ext > 0.92 * e95) & (align > 0.90)        # straight stance leg, unbent torso
     still = vel < np.nanpercentile(vel[np.isfinite(vel)], 35)
     # heels must be depth-VISIBLE, not inpainted: their sampled depth has to sit inside the
     # body band (occluded heels - e.g. behind the open dishwasher door - read scene depth and
@@ -190,6 +195,15 @@ def main():
     width = np.linalg.norm(rel3[:, ki["lheel"]] - rel3[:, ki["rheel"]], axis=1)
     narrow = width < 0.45 * np.maximum(leglen, 1e-6)
     standable = upright & (ext > 0.96 * e95) & still & (tsec >= T_MIN) & heels_seen & narrow
+    if standable.sum() < max(5, int(0.5 * FPS)):
+        # heel depth-band visibility is an occlusion guard, not a hard requirement - on
+        # low-confidence floors (dark studio) VGGT never confirms the heels and the guard
+        # would starve the stance set (per-joint depth falls back to the body depth anyway)
+        relaxed = upright & (ext > 0.96 * e95) & still & (tsec >= T_MIN) & narrow
+        if relaxed.sum() > standable.sum():
+            print(f"[lift] auto stance: heel-visibility guard relaxed "
+                  f"({int(standable.sum())} -> {int(relaxed.sum())} frames)")
+            standable = relaxed
     # window choice is deferred until world joints exist: candidate windows are ranked by
     # how well their implied FLOOR generalizes to all other standing frames (an occluder in
     # front of the feet - e.g. the pulled-out dishwasher rack - passes the depth-band check
@@ -246,8 +260,12 @@ def main():
             print(f"[lift] auto stance: {int(standable.sum())} frames spread over "
                   f"t={tt.min():.2f}..{tt.max():.2f} s")
         else:
-            print("[lift] WARN: no visible-heel standing frames - MR_STAND defaults")
             stand_auto = (tsec >= STAND0) & (tsec <= STAND1)
+            if not stand_auto.any():                     # default window beyond a short clip
+                stand_auto = upright & still if (upright & still).any() else \
+                    np.ones(N, bool)
+            print(f"[lift] WARN: no standing frames detected - fallback stance mask "
+                  f"({int(stand_auto.sum())} frames)")
     stand = (tsec >= STAND0) & (tsec <= STAND1) if STAND_SET else stand_auto
 
     if not STAND_SET:
@@ -262,11 +280,13 @@ def main():
             lo = np.where(Jw[:, lh, 2] < Jw[:, rh, 2], lh, rh)
             H = Jw[np.arange(len(Jw)), lo][stand]
             H = H[np.isfinite(H[:, 2])]
+            if len(H) < 30:
+                print("[lift] up refine: skipped (insufficient standing heels)")
+                break
             span = np.ptp(H[:, :2], axis=0)
-            if len(H) < 30 or min(span) < 0.15 * max(span, key=abs) or max(span) < 1e-3:
-                if min(span, default=0) < 1e-3 or len(H) < 30:
-                    print("[lift] up refine: skipped (insufficient heel spread)")
-                    break
+            if max(span) < 1e-3 or min(span) < 0.03:
+                print("[lift] up refine: skipped (insufficient heel spread)")
+                break
             A = np.hstack([H[:, :2], np.ones((len(H), 1))])
             coef, *_ = np.linalg.lstsq(A, H[:, 2], rcond=None)
             nrm = np.array([-coef[0], -coef[1], 1.0]); nrm /= np.linalg.norm(nrm)

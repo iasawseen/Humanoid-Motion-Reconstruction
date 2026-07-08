@@ -97,12 +97,18 @@ def render_frame(n):
     good = C > cw.CONF_MIN
     X = (cw.US - cw.w / 2) / fx * D
     Y = (cw.VS - cw.h / 2) / fy * D
-    Dg = D[good]
-    if Dg.numel():                                       # numpy-median semantics
-        s, k = Dg.sort().values, Dg.numel()
-        zmid = float(0.5 * (s[(k - 1) // 2] + s[k // 2]))
+    # tilt pivot at the SUBJECT's depth when a fit exists (same fix as collate_video:
+    # the scene-median pivot throws the subject off-pane when confident pixels are
+    # dominated by far structure)
+    if cw.ok[n]:
+        zmid = float(np.median(cw.J_cam[n][:, 2]))
     else:
-        zmid = 1.0
+        Dg = D[good]
+        if Dg.numel():                                   # numpy-median semantics
+            s, k = Dg.sort().values, Dg.numel()
+            zmid = float(0.5 * (s[(k - 1) // 2] + s[k // 2]))
+        else:
+            zmid = 1.0
     ca, sa = float(np.cos(cw.TILT)), float(np.sin(cw.TILT))
     Yt = ca * Y - sa * (D - zmid)
     Zt = (sa * Y + ca * (D - zmid) + zmid).clamp(min=1e-4)

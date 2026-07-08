@@ -157,11 +157,19 @@ def gpu_splat_t(uv, zv, cols, Hp, Wp, splat=2):
     return img
 
 
-# BEV mapping (from lift3d scene, like birdseye_video)
-allx = np.concatenate([P_scene[:, 0], [cam_pos[0]]])
-ally = np.concatenate([P_scene[:, 1], [cam_pos[1]]])
-x0, x1 = np.percentile(allx, [0.5, 99.5]); y0, y1 = np.percentile(ally, [0.5, 99.5])
-bscale = min((BW - 40) / (x1 - x0 + 0.8), (H - 40) / (y1 - y0 + 0.8))
+# BEV mapping: SUBJECT-centric framing - the pane exists to show the skeleton/trail, and
+# scene-percentile framing collapses it to a sliver when the cloud is large or noisy (dark
+# studio walls). Bounds = trajectory bbox + margin; scene points landing inside just show.
+mid_all = 0.5 * (J_w[:, I["lhip"], :2] + J_w[:, I["rhip"], :2])
+if ok.any():
+    px_, py_ = mid_all[ok, 0], mid_all[ok, 1]
+    mg = max(1.0, 0.45 * max(px_.max() - px_.min(), py_.max() - py_.min()))
+    x0, x1 = px_.min() - mg, px_.max() + mg
+    y0, y1 = py_.min() - mg, py_.max() + mg
+else:                                                    # no fit: fall back to the scene
+    x0, x1 = np.percentile(P_scene[:, 0], [0.5, 99.5])
+    y0, y1 = np.percentile(P_scene[:, 1], [0.5, 99.5])
+bscale = min((BW - 40) / (x1 - x0 + 1e-6), (H - 40) / (y1 - y0 + 1e-6))
 bcx, bcy = 0.5 * (x0 + x1), 0.5 * (y0 + y1)
 
 
@@ -219,12 +227,18 @@ def render_frame(n):
     good = C > CONF_MIN
     X = (US - w / 2) / fx * D
     Y = (VS - h / 2) / fy * D
-    Dg = D[good]
-    if Dg.numel():                                       # numpy-median semantics (mid-pair mean)
-        s, k = Dg.sort().values, Dg.numel()
-        zmid = float(0.5 * (s[(k - 1) // 2] + s[k // 2]))
+    # tilt pivot at the SUBJECT's depth when a fit exists: pivoting at the scene median
+    # throws the skeleton off-pane when confident pixels are dominated by far structure
+    # (ceiling/walls); with the subject as pivot the scene rotates around the skeleton.
+    if ok[n]:
+        zmid = float(np.median(Jc[:, 2]))
     else:
-        zmid = 1.0
+        Dg = D[good]
+        if Dg.numel():                                   # numpy-median semantics (mid-pair mean)
+            s, k = Dg.sort().values, Dg.numel()
+            zmid = float(0.5 * (s[(k - 1) // 2] + s[k // 2]))
+        else:
+            zmid = 1.0
     ca, sa = float(np.cos(TILT)), float(np.sin(TILT))
     Yt = ca * Y - sa * (D - zmid)
     Zt = (sa * Y + ca * (D - zmid) + zmid).clamp(min=1e-4)
