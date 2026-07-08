@@ -22,6 +22,15 @@ import numpy as np
 WORK = os.environ["DEPTH_WORK"]
 FPS = float(os.environ.get("MR_FPS", 24000 / 1001))
 T_MIN = float(os.environ.get("MR_TMIN", "4.0"))          # discard unreliable head of the video
+# Calibration windows. MR_AUTO=1 auto-detects them from the subject (leg-extension ratio
+# = upright, + pose stillness = standing; dominant upright facing = yaw anchor; heel-plane
+# up leveling). Default (MR_AUTO unset) keeps the env-var windows below - auto mode is
+# validated for cross-resolution stability (~3 cm) but not yet at parity with hand-tuned
+# windows (see bench/): the lift-space vs fit-space heel discrepancy is unresolved.
+AUTO = os.environ.get("MR_AUTO", "0") == "1"
+STAND_SET = not AUTO or "MR_STAND0" in os.environ or "MR_STAND1" in os.environ
+YAW_SET = not AUTO or "MR_YAW0" in os.environ or "MR_YAW1" in os.environ
+UP_SET = not AUTO or "MR_UP0" in os.environ or "MR_UP1" in os.environ
 STAND0 = float(os.environ.get("MR_STAND0", "7.5"))       # upright-stance calibration window
 STAND1 = float(os.environ.get("MR_STAND1", "9.5"))
 YAW0 = float(os.environ.get("MR_YAW0", "8.0"))           # facing-anchor window (+X)
@@ -79,6 +88,7 @@ def main():
     dfiles = sorted(glob.glob(os.path.join(WORK, "depth", "f*.npz")))
     N = len(dfiles)
     joints_cam = np.full((N, len(KIDX), 3), np.nan)
+    kp3d_all = np.full((N, len(KIDX), 3), np.nan)        # SAM camera-frame kps (calibration)
     kp2d_all = np.full((N, len(KIDX), 2), np.nan)
     cams = np.full((N, 6), np.nan)
     d_body_raw = np.full(N, np.nan)
@@ -104,8 +114,10 @@ def main():
         h, w = D.shape
         fx, fy, cx, cy = cam_of(pe, h, w)
         su, sv = w / W_IMG, h / H_IMG
-        kp2d = np.load(mf)["kp2d"]
+        mz = np.load(mf)
+        kp2d = mz["kp2d"]
         kp2d_all[n] = kp2d[KIDX]
+        kp3d_all[n] = mz["kp3d"][KIDX]
         cams[n] = [fx, fy, cx, cy, su, sv]
         # body depth: hips only (widest part of the silhouette; neck/shoulders bleed at edges)
         core = [KP["lhip"], KP["rhip"]]
@@ -138,6 +150,56 @@ def main():
     # p_chain = cam_R^T @ (p_cam - cam_T); identity for static-camera runs
     joints_cam = np.einsum("nji,nkj->nki", camR, joints_cam - camT[:, None])
 
+    # ---- auto-calibration (when MR_STAND*/MR_UP*/MR_YAW* are unset): detect upright and
+    # standing frames from the subject itself. Leg-extension ratio (hip->heel distance over
+    # summed leg segment lengths, from SAM kp3d) is gravity-free, so there is no
+    # chicken-and-egg with the unknown up vector; stillness = pelvis-centred pose velocity.
+    ki = {name: KIDX.index(KP[name]) for name in KP}
+    midhip3 = 0.5 * (kp3d_all[:, ki["lhip"]] + kp3d_all[:, ki["rhip"]])
+    rel3 = kp3d_all - midhip3[:, None]
+    def _ext(side):
+        L = (np.linalg.norm(rel3[:, ki[side + "hip"]] - rel3[:, ki[side + "kne"]], axis=1)
+             + np.linalg.norm(rel3[:, ki[side + "kne"]] - rel3[:, ki[side + "ank"]], axis=1)
+             + np.linalg.norm(rel3[:, ki[side + "ank"]] - rel3[:, ki[side + "heel"]], axis=1))
+        return np.linalg.norm(rel3[:, ki[side + "hip"]] - rel3[:, ki[side + "heel"]], axis=1) /             np.maximum(L, 1e-6)
+    ext = 0.5 * (_ext("l") + _ext("r"))
+    # straight legs are NOT enough: the subject bends at the hips with straight legs (rack
+    # work), which tilts the torso while ext stays high. Standing straight means torso
+    # anti-parallel to the legs - frame-internal, no gravity needed.
+    torso3 = rel3[:, ki["neck"]]
+    legdir3 = 0.5 * (rel3[:, ki["lheel"]] + rel3[:, ki["rheel"]])
+    align = -np.einsum("ni,ni->n", torso3, legdir3) / np.maximum(
+        np.linalg.norm(torso3, axis=1) * np.linalg.norm(legdir3, axis=1), 1e-9)
+    vel = np.full(N, np.nan)
+    dv = np.linalg.norm(np.diff(rel3, axis=0), axis=2)   # [N-1, K]
+    vel[1:] = np.nanmedian(dv, axis=1) * FPS
+    e95 = np.nanpercentile(ext, 95)
+    upright = (ext > 0.92 * e95) & (align > 0.93)        # straight legs AND unbent torso
+    still = vel < np.nanpercentile(vel[np.isfinite(vel)], 35)
+    # heels must be depth-VISIBLE, not inpainted: their sampled depth has to sit inside the
+    # body band (occluded heels - e.g. behind the open dishwasher door - read scene depth and
+    # poison the floor estimate; an auto window at t~30 s cost 7 cm of floor height)
+    heel_j = [KIDX.index(KP["lheel"]), KIDX.index(KP["rheel"])]
+    heels_seen = np.isfinite(djoint_raw[:, heel_j]).all(1)
+    heels_seen &= np.abs(djoint_raw[:, heel_j] - d_body[:, None]).max(1) < 0.06 * np.where(
+        np.isfinite(d_body), d_body, np.inf)
+    # feet together matters: leg splay lowers the pelvis even with straight legs and an
+    # unbent torso (work stance), which dilutes the pelvis-height median -> wrong kappa
+    leglen = 0.5 * (np.linalg.norm(rel3[:, ki["lhip"]] - rel3[:, ki["lheel"]], axis=1)
+                    + np.linalg.norm(rel3[:, ki["rhip"]] - rel3[:, ki["rheel"]], axis=1))
+    width = np.linalg.norm(rel3[:, ki["lheel"]] - rel3[:, ki["rheel"]], axis=1)
+    narrow = width < 0.45 * np.maximum(leglen, 1e-6)
+    standable = upright & (ext > 0.96 * e95) & still & (tsec >= T_MIN) & heels_seen & narrow
+    # window choice is deferred until world joints exist: candidate windows are ranked by
+    # how well their implied FLOOR generalizes to all other standing frames (an occluder in
+    # front of the feet - e.g. the pulled-out dishwasher rack - passes the depth-band check
+    # but yields a floor that strands every other standing frame's heels ~15 cm in the air)
+    stand_auto = None                                    # resolved below, needs Jw
+    up_auto = upright.copy()
+    if up_auto.sum() < 10:
+        print("[lift] WARN: too few upright frames - falling back to MR_UP defaults")
+        up_auto = (tsec >= UP0) & (tsec <= UP1)
+
     # ---- gravity alignment: floor plane from robot-free title frames (dense unprojection)
     pts = []
     for k in range(0, 4):
@@ -158,7 +220,7 @@ def main():
     # UP from the robot itself: the walking/standing torso is the most reliable plumb line here
     # (VGGT depth on the textureless floor is bowed - a floor-plane normal came out ~30 deg off,
     # measured by the standing robot's torso). Floor points only set the height offset below.
-    upr = (tsec >= UP0) & (tsec <= UP1)
+    upr = (tsec >= UP0) & (tsec <= UP1) if UP_SET else up_auto
     tor = joints_cam[upr, KIDX.index(KP["neck"])] - 0.5 * (
         joints_cam[upr, KIDX.index(KP["lhip"])] + joints_cam[upr, KIDX.index(KP["rhip"])])
     tor = tor[np.isfinite(tor[:, 0])]
@@ -173,7 +235,56 @@ def main():
     Jw = np.einsum("ij,nkj->nki", R, joints_cam)
     # floor + scale from the ROBOT itself (scene-histogram peaks proved unreliable):
     # feet touch the floor while standing, and the standing pelvis height is known
-    stand = (tsec >= STAND0) & (tsec <= STAND1)
+    if not STAND_SET:
+        # ALL qualifying frames vote on floor/scale: medians over a few hundred spread
+        # frames resist a locally-corrupted span (rack in front of the feet for ~2 s),
+        # where any single elected window can silently inherit it. Fit-side calibration
+        # (pelvis-plateau kappa + floor re-anchor) covers the residuals.
+        if standable.sum() >= max(5, int(0.5 * FPS)):
+            stand_auto = standable
+            tt = tsec[standable]
+            print(f"[lift] auto stance: {int(standable.sum())} frames spread over "
+                  f"t={tt.min():.2f}..{tt.max():.2f} s")
+        else:
+            print("[lift] WARN: no visible-heel standing frames - MR_STAND defaults")
+            stand_auto = (tsec >= STAND0) & (tsec <= STAND1)
+    stand = (tsec >= STAND0) & (tsec <= STAND1) if STAND_SET else stand_auto
+
+    if not STAND_SET:
+        # UP refinement: the torso is only a proxy (the subject leans toward its work on
+        # average - the residual showed up as an 8-12 deg standing-heel floor tilt across
+        # the visited area). The standing heels themselves ARE the level reference: fit a
+        # plane to the lower-heel world points and rotate its normal to +Z. Needs xy
+        # spread; skipped when the subject never moves.
+        for _ in range(1):                               # single pass: reselecting the
+                                                         # lower heel after rotation can oscillate
+            lh, rh = KIDX.index(KP["lheel"]), KIDX.index(KP["rheel"])
+            lo = np.where(Jw[:, lh, 2] < Jw[:, rh, 2], lh, rh)
+            H = Jw[np.arange(len(Jw)), lo][stand]
+            H = H[np.isfinite(H[:, 2])]
+            span = np.ptp(H[:, :2], axis=0)
+            if len(H) < 30 or min(span) < 0.15 * max(span, key=abs) or max(span) < 1e-3:
+                if min(span, default=0) < 1e-3 or len(H) < 30:
+                    print("[lift] up refine: skipped (insufficient heel spread)")
+                    break
+            A = np.hstack([H[:, :2], np.ones((len(H), 1))])
+            coef, *_ = np.linalg.lstsq(A, H[:, 2], rcond=None)
+            nrm = np.array([-coef[0], -coef[1], 1.0]); nrm /= np.linalg.norm(nrm)
+            tilt = np.degrees(np.arccos(np.clip(nrm[2], -1, 1)))
+            ax = np.cross(nrm, [0.0, 0.0, 1.0])
+            sa = np.linalg.norm(ax)
+            if sa < 1e-8:
+                break
+            ax /= sa; ca = nrm[2]
+            Kx = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+            R2 = np.eye(3) + sa * Kx + (1 - ca) * (Kx @ Kx)
+            Jw = np.einsum("ij,nkj->nki", R2, Jw)
+            R = R2 @ R                                   # keep the camera chain consistent
+            print(f"[lift] up refine: heel-plane tilt {tilt:.2f} deg leveled "
+                  f"({len(H)} standing heels)")
+            if tilt < 0.3:
+                break
+
     heels = Jw[stand][:, [KIDX.index(KP["lheel"]), KIDX.index(KP["rheel"])], 2]
     zfloor = float(np.nanmedian(heels))
     pelv_z = float(np.nanmedian(0.5 * (Jw[stand, KIDX.index(KP["lhip"]), 2]
@@ -194,12 +305,51 @@ def main():
     # kitchen frame: +X = the robot's facing during dishwasher work (median hip-line x up)
     names = list(KP)
     hipv = Jw[:, names.index("lhip")] - Jw[:, names.index("rhip")]
-    work = (tsec >= YAW0) & (tsec <= YAW1)
-    hv = hipv[work]
-    hv = hv[np.isfinite(hv[:, 0])]
-    hmed = np.median(hv, 0); hmed[2] = 0.0
-    fwd = np.cross(hmed, [0, 0, 1.0])                    # facing = hipline x up (z-up frame)
-    fwd = -fwd / np.linalg.norm(fwd)
+    if YAW_SET:
+        work = (tsec >= YAW0) & (tsec <= YAW1)
+        hv = hipv[work]
+        hv = hv[np.isfinite(hv[:, 0])]
+        hmed = np.median(hv, 0); hmed[2] = 0.0
+        fwd = np.cross(hmed, [0, 0, 1.0])                # facing = hipline x up (z-up frame)
+        fwd = -fwd / np.linalg.norm(fwd)
+    else:
+        # auto yaw = DOMINANT upright facing, chirality-proof. Raw hip lines carry SAM's
+        # front/back mirror (~18% of frames flip them 180 deg), so a plain median lands
+        # mid-mixture: use the AXIAL mean (angle doubling - sign-invariant), then resolve
+        # the 180 deg sign by the walking direction (pelvis velocity while moving fast).
+        m = up_auto & (tsec >= T_MIN) & np.isfinite(hipv[:, 0])
+        f_n = np.cross(hipv[m], [0, 0, 1.0]); f_n = -f_n
+        ang = np.arctan2(f_n[:, 1], f_n[:, 0])
+        a2 = np.angle(np.mean(np.exp(2j * ang))) / 2.0   # axial mean, modulo pi
+        axial = np.array([np.cos(a2), np.sin(a2), 0.0])
+        pelv_xy = 0.5 * (Jw[:, names.index("lhip"), :2] + Jw[:, names.index("rhip"), :2])
+        v_xy = np.full((N, 2), np.nan)
+        v_xy[1:] = np.diff(pelv_xy, axis=0) * FPS
+        spd = np.linalg.norm(v_xy, axis=1)
+        # walking = sustained displacement, not sway: absolute speed floor (units: scaled
+        # world, standing pelvis = PELVIS_H) plus direction consistency, else the sign is
+        # depth-noise (it flipped between VGGT resolutions on sway-only frames)
+        fastm = np.isfinite(spd) & (spd > 0.3 * PELVIS_H) & (tsec >= T_MIN)
+        # longest contiguous moving run; its NET displacement direction is arc-robust
+        # (mean per-frame direction fails on curved walk-ins and sign-flips across runs)
+        r0 = r1 = b0 = b1 = -1
+        for n in range(N + 1):
+            if n < N and fastm[n]:
+                r1 = n; r0 = n if r0 < 0 or not fastm[n - 1] else r0
+            elif r0 >= 0:
+                if r1 - r0 > b1 - b0:
+                    b0, b1 = r0, r1
+                r0 = -1
+        if b1 - b0 + 1 >= int(0.5 * FPS):
+            net = pelv_xy[min(b1 + 1, N - 1)] - pelv_xy[b0]
+            sgn = np.sign(net @ axial[:2])
+            src = f"walk net displacement (t={tsec[b0]:.1f}..{tsec[b1]:.1f} s)"
+        else:                                            # planted subject: majority raw sign
+            sgn = np.sign(np.median(f_n[:, :2] @ axial[:2]))
+            src = "majority hip-line sign"
+        fwd = (sgn if sgn != 0 else 1.0) * axial
+        print(f"[lift] auto yaw: facing ({fwd[0]:+.2f},{fwd[1]:+.2f}), sign from {src}, "
+              f"{int(m.sum())} frames")
     # rotate so fwd -> +X
     c, s2 = fwd[0], fwd[1]
     Rz = np.array([[c, s2, 0], [-s2, c, 0], [0, 0, 1.0]])
@@ -224,6 +374,7 @@ def main():
                         scene=Pw[::3].astype(np.float32),
                         cam_pos=cam_pos_w.astype(np.float64), R_cam2world=Rcw.astype(np.float64),
                         scale=np.float64(scale), fov_h=np.float64(np.median(fovs)),
+                        stand_mask=stand, upright_mask=(upright & (tsec >= T_MIN)),
                         M_c2w=M_c2w.astype(np.float64), c_c2w=c_c2w.astype(np.float64))
     print(f"[lift] {ok.sum()}/{N} frames lifted; cam at {cam_pos_w.round(2)}, "
           f"cam travel {np.linalg.norm(c_c2w - c_c2w[0], axis=1).max():.2f}u")

@@ -63,6 +63,16 @@ python -m humanoid_motion_recon.lift_mesh
 `MR_YAW0/1`, `MR_UP0/1` (yaw/up calibration windows), `MR_PELVIS_H` (standing pelvis height,
 meters). Set per scenario; defaults suit a ~1.7 m subject.
 
+**Experimental `MR_AUTO=1`**: auto-detects the stance/up/yaw windows from the subject
+(leg-extension + torso-alignment uprightness, pose-velocity stillness, heel depth-band
+visibility; yaw = dominant upright facing with walk-displacement sign; heel-plane up
+leveling; fit-side floor re-anchor + pelvis-plateau robust kappa). Validated
+cross-resolution stable (~3 cm inter-config MPJPE, yaw ~1.3 deg) but NOT yet at parity
+with hand-tuned windows (~10 cm local MPJPE vs a tuned reference; root cause: lift-space
+depth heels vs fit-space SAM-offset heels disagree systematically, so lift-side leveling
+cannot zero fit-side tilt). Individual env vars still override single windows. Gate any
+change with `bench/quality_gate.py`.
+
 ## Visualization / QA renderers
 
 All torch-CUDA (no OpenGL): `collate_video` (4-pane: overlay | depth | skeleton-over-cloud |

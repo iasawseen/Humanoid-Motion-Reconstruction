@@ -208,12 +208,54 @@ def main():
     # body-size calibration from the subject: the pelvis rides the depth ray (height is right
     # by construction), but the OFFSETS are sized by SAM's absolute depth, which wobbles.
     # During the stand window the heels must touch the floor -> uniform rescale about mid-hip.
-    st0 = float(os.environ.get("MR_STAND0", "7.5"))
-    st1 = float(os.environ.get("MR_STAND1", "9.5"))
     midw = 0.5 * (Jw[:, LH] + Jw[:, RH])
-    m_st = (tsec >= st0) & (tsec <= st1) & np.isfinite(Jw[:, :, 2]).all(1)
+    fin = np.isfinite(Jw[:, :, 2]).all(1)
+    env_stand = os.environ.get("MR_AUTO", "0") != "1" or \
+        "MR_STAND0" in os.environ or "MR_STAND1" in os.environ
+    m_up = None
+    if not env_stand and "upright_mask" in z and len(z["upright_mask"]) == N:
+        m_up = z["upright_mask"] & fin                   # robust kappa over ALL upright frames
+        m_st = z["stand_mask"] & fin if "stand_mask" in z and len(z["stand_mask"]) == N else m_up
+    elif not env_stand and "stand_mask" in z and len(z["stand_mask"]) == N:
+        m_st = z["stand_mask"] & fin                     # same frames lift_skeleton calibrated on
+    else:
+        st0 = float(os.environ.get("MR_STAND0", "7.5"))
+        st1 = float(os.environ.get("MR_STAND1", "9.5"))
+        m_st = (tsec >= st0) & (tsec <= st1) & fin
     kappa = 1.0
-    if m_st.sum() >= 3:
+    if m_up is not None:
+        # SAM's offset-scale error varies across the video, so a single stance window can be
+        # a local outlier (a rack in front of the feet reads as heels near the floor), and
+        # SAM-geometry "upright" still includes near-stands with heels physically raised.
+        # Robust estimator: implied per-frame kappa over the PELVIS-PLATEAU frames (the
+        # subject at full standing height => heels on the floor), measured in fit space -
+        # the median zeroes the standing heel float by construction.
+        pel_z = midw[:, 2]
+        m_tall = fin & (pel_z > np.nanpercentile(pel_z[fin], 85) * 0.97)
+        # exclude tiptoe frames (reach-ups raise the pelvis ABOVE the stand plateau on
+        # legitimately lifted heels -> implied kappa explodes); flat feet have heel ~ toe z,
+        # and the gap is only mildly kappa-sensitive so it works pre-correction
+        gap = np.maximum(Jw[:, KPN.index("lheel"), 2] - Jw[:, KPN.index("lbtoe"), 2],
+                         Jw[:, KPN.index("rheel"), 2] - Jw[:, KPN.index("rbtoe"), 2])
+        m_tall &= gap < 0.05
+        pz = pel_z[m_tall]
+        hz = np.minimum(Jw[m_tall, KPN.index("lheel"), 2], Jw[m_tall, KPN.index("rheel"), 2])
+        # re-anchor the floor here rather than trusting lift's stance window (a corrupted
+        # window shifts zfloor, and kappa cannot repair a wrong floor): standing pelvis
+        # sits at PELVIS_H by convention, so the plateau median fixes the offset; kappa
+        # then zeroes the standing heels against THAT floor.
+        pelvis_h = float(os.environ.get("MR_PELVIS_H", "0.72"))
+        dz = float(np.median(pz)) - pelvis_h
+        k_n = (pz - dz) / np.maximum(pz - hz, 1e-6)
+        k_n = k_n[np.isfinite(k_n) & (k_n > 0.5) & (k_n < 2.0)]
+        if len(k_n) >= 30:
+            kappa = float(np.median(k_n))
+            Jw[:, :, 2] -= dz
+            midw = 0.5 * (Jw[:, LH] + Jw[:, RH])
+            Jw = midw[:, None] + kappa * (Jw - midw[:, None])
+            print(f"[fit] body-size calib: floor re-anchor {dz:+.3f}u, robust kappa "
+                  f"{kappa:.3f} (median over {len(k_n)} pelvis-plateau frames)")
+    if kappa == 1.0 and m_st.sum() >= 3:
         pelv_z = np.median(midw[m_st, 2])
         heel_z = np.median(0.5 * (Jw[m_st, KPN.index("lheel"), 2]
                                   + Jw[m_st, KPN.index("rheel"), 2]))
