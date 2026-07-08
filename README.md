@@ -63,15 +63,27 @@ python -m humanoid_motion_recon.lift_mesh
 `MR_YAW0/1`, `MR_UP0/1` (yaw/up calibration windows), `MR_PELVIS_H` (standing pelvis height,
 meters). Set per scenario; defaults suit a ~1.7 m subject.
 
-**Experimental `MR_AUTO=1`**: auto-detects the stance/up/yaw windows from the subject
-(leg-extension + torso-alignment uprightness, pose-velocity stillness, heel depth-band
-visibility; yaw = dominant upright facing with walk-displacement sign; heel-plane up
-leveling; fit-side floor re-anchor + pelvis-plateau robust kappa). Validated
-cross-resolution stable (~3 cm inter-config MPJPE, yaw ~1.3 deg) but NOT yet at parity
-with hand-tuned windows (~10 cm local MPJPE vs a tuned reference; root cause: lift-space
-depth heels vs fit-space SAM-offset heels disagree systematically, so lift-side leveling
-cannot zero fit-side tilt). Individual env vars still override single windows. Gate any
-change with `bench/quality_gate.py`.
+**`MR_AUTO=1`** auto-detects all calibration from the subject: stance/uprightness =
+leg-extension + torso-leg alignment + stillness + heel depth-band visibility (all
+qualifying frames vote on lift floor/scale); yaw = chirality-proof axial dominant facing,
+sign from walk net displacement; kappa = per-frame implied kappa over pelvis-plateau
+frames (tiptoes excluded); **up = standing-heel-plane leveling measured in fit space**,
+with the rigid correction exported back into `lift3d.npz` (scene, camera chain, lift
+joints) so all consumers share one world. Division of ownership: floor + metric scale are
+lift-owned (scene must meet the feet), kappa is fit-owned (offsets vs depth ray), up is
+fit-measured and propagated to both. Validated: cross-resolution (512/448) stable to
+2 cm / 1.3 deg / 0.3% kappa; floor level to ~1.6 deg with +0.6 cm standing heel float
+(the hand-tuned legacy windows leave an 8.5 deg floor tilt on the same data); re-runs of
+fit converge (each pass re-levels the residual). Auto's +X convention is the subject's
+true dominant facing, which can differ from hand-pinned `MR_YAW` conventions - compare
+across conventions with `bench/quality_gate.py --align-yaw`. Individual env vars still
+override single windows.
+
+## Videos
+
+`videos/` (gitignored, local-only) is the conventional home for source clips and rendered
+QA videos: `videos/input/<name>.mp4` and `videos/output/<scenario>/*.mp4`. Renderers write
+wherever `MR_OUT` points; move keepers here.
 
 ## Visualization / QA renderers
 

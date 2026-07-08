@@ -187,7 +187,8 @@ def main():
     r_s = np.array([np.median(r_i[max(0, i - pr):i + pr + 1]) for i in idx])
 
     # rigid re-lift: pelvis on its ray at the body depth; joints = ratio-scaled SAM offsets
-    z = np.load(os.path.join(os.environ.get("MR_OUT", OUTD), "lift3d.npz"))
+    LIFT_NPZ = os.path.join(os.environ.get("MR_OUT", OUTD), "lift3d.npz")
+    z = np.load(LIFT_NPZ)
     Rcw, scale, cam_pos = z["R_cam2world"], float(z["scale"]), z["cam_pos"]
     h, w = np.load(dfiles[0])["depth"].shape
     Jc = np.full((N, len(KIDX), 3), np.nan)
@@ -238,24 +239,50 @@ def main():
         gap = np.maximum(Jw[:, KPN.index("lheel"), 2] - Jw[:, KPN.index("lbtoe"), 2],
                          Jw[:, KPN.index("rheel"), 2] - Jw[:, KPN.index("rbtoe"), 2])
         m_tall &= gap < 0.05
+        # UP unification: lift levels its own depth-based heels, but the residual tilt in
+        # FIT space (SAM-offset heels) stayed ~6 deg - the two heel sources disagree
+        # systematically. Measure the standing-heel plane HERE, level it, and export the
+        # same rigid correction back into lift3d (scene, camera chain, lift joints) so all
+        # consumers keep sharing one world. Floor and metric scale stay lift-owned (the
+        # scene floor must coincide with the feet); kappa stays fit-owned (offsets vs ray).
+        R_f, c0, ddz = np.eye(3), np.zeros(3), 0.0
+        lo = np.where(Jw[:, KPN.index("lheel"), 2] < Jw[:, KPN.index("rheel"), 2],
+                      KPN.index("lheel"), KPN.index("rheel"))
+        H = Jw[np.arange(N), lo][m_tall]
+        H = H[np.isfinite(H[:, 2])]
+        if len(H) >= 30 and min(np.ptp(H[:, :2], axis=0)) > 0.05:
+            A = np.hstack([H[:, :2], np.ones((len(H), 1))])
+            coef, *_ = np.linalg.lstsq(A, H[:, 2], rcond=None)
+            nrm = np.array([-coef[0], -coef[1], 1.0]); nrm /= np.linalg.norm(nrm)
+            tilt = np.degrees(np.arccos(np.clip(nrm[2], -1, 1)))
+            ax = np.cross(nrm, [0.0, 0.0, 1.0]); sa = np.linalg.norm(ax)
+            if sa > 1e-8 and tilt < 25.0:
+                ax /= sa; ca = nrm[2]
+                Kx = np.array([[0, -ax[2], ax[1]], [ax[2], 0, -ax[0]], [-ax[1], ax[0], 0]])
+                R_f = np.eye(3) + sa * Kx + (1 - ca) * (Kx @ Kx)
+                c0 = H.mean(0)                           # pivot: heel centroid keeps the
+                Jw = (Jw - c0) @ R_f.T + c0              # floor height ~unchanged
+                # NO floor re-zero here: the floor is lift-owned (scene must meet the
+                # feet), and zeroing at fit heels would consume kappa's observable
+                midw = 0.5 * (Jw[:, LH] + Jw[:, RH])
+                print(f"[fit] up unify: fit-space heel-plane tilt {tilt:.2f} deg leveled "
+                      f"({len(H)} standing heels)")
+        pel_z = midw[:, 2]
         pz = pel_z[m_tall]
         hz = np.minimum(Jw[m_tall, KPN.index("lheel"), 2], Jw[m_tall, KPN.index("rheel"), 2])
-        # re-anchor the floor here rather than trusting lift's stance window (a corrupted
-        # window shifts zfloor, and kappa cannot repair a wrong floor): standing pelvis
-        # sits at PELVIS_H by convention, so the plateau median fixes the offset; kappa
-        # then zeroes the standing heels against THAT floor.
-        pelvis_h = float(os.environ.get("MR_PELVIS_H", "0.72"))
-        dz = float(np.median(pz)) - pelvis_h
-        k_n = (pz - dz) / np.maximum(pz - hz, 1e-6)
+        k_n = pz / np.maximum(pz - hz, 1e-6)
         k_n = k_n[np.isfinite(k_n) & (k_n > 0.5) & (k_n < 2.0)]
+        did_robust = False
         if len(k_n) >= 30:
             kappa = float(np.median(k_n))
-            Jw[:, :, 2] -= dz
-            midw = 0.5 * (Jw[:, LH] + Jw[:, RH])
+            did_robust = True
             Jw = midw[:, None] + kappa * (Jw - midw[:, None])
-            print(f"[fit] body-size calib: floor re-anchor {dz:+.3f}u, robust kappa "
-                  f"{kappa:.3f} (median over {len(k_n)} pelvis-plateau frames)")
-    if kappa == 1.0 and m_st.sum() >= 3:
+            print(f"[fit] body-size calib: robust kappa {kappa:.3f} "
+                  f"(median over {len(k_n)} pelvis-plateau frames)")
+        UP_FIX = (R_f, c0) if not np.allclose(R_f, np.eye(3)) else None
+        # (export to lift3d happens at the end - overwriting the npz while the read handle
+        # is open corrupts it)
+    if m_up is None and kappa == 1.0 and m_st.sum() >= 3:
         pelv_z = np.median(midw[m_st, 2])
         heel_z = np.median(0.5 * (Jw[m_st, KPN.index("lheel"), 2]
                                   + Jw[m_st, KPN.index("rheel"), 2]))
@@ -286,9 +313,13 @@ def main():
     ok &= tsec >= T_MIN                                  # unreliable head discarded
     # kappa is a WORLD-space calibration; overlay renderers that reproject joints_w against the
     # video must divide the mid-hip-relative offsets by it (see collate_video / pose_over_cloud)
+    scene_out = z["scene"]
+    if m_up is not None and UP_FIX is not None:
+        R_f, c0 = UP_FIX
+        scene_out = ((scene_out.astype(np.float64) - c0) @ R_f.T + c0).astype(np.float32)
     np.savez_compressed(os.path.join(os.environ.get("MR_OUT", OUTD), "fit3d.npz"),
                         joints_w=Jw.astype(np.float32), t=tsec, ok=ok, kappa=np.float32(kappa),
-                        a=a_s, b=b_s, npix=npix, scene=z["scene"], cam_pos=cam_pos)
+                        a=a_s, b=b_s, npix=npix, scene=scene_out, cam_pos=cam_pos)
     print(f"[fit] {ok.sum()}/{N} frames -> fit3d.npz")
 
     # ---- verification vs the naive lift
@@ -313,6 +344,25 @@ def main():
         seam = (fi % 16 == 0)[:len(okd)]
         print(f"[{tag}] pelvis step: within-window {np.median(d[okd & ~seam])*100:.1f} cm, "
               f"window seam {np.median(d[okd & seam])*100:.1f} cm")
+
+    if m_up is not None and UP_FIX is not None:
+        # export the up correction so lift3d's scene/camera/joints stay congruent with
+        # fit3d: x' = R_f (x - c0) + c0  (affine => exact for the M_c2w chain). Done after
+        # every read of z; the handle is closed before the file is rewritten.
+        R_f, c0 = UP_FIX
+        z.close()
+        with np.load(LIFT_NPZ) as f:
+            lz = {k: f[k] for k in f.files}
+        for k in ("joints_w", "scene"):
+            lz[k] = ((lz[k].astype(np.float64) - c0) @ R_f.T + c0).astype(np.float32)
+        if "M_c2w" in lz:
+            lz["M_c2w"] = np.einsum("ij,njk->nik", R_f, lz["M_c2w"])
+            lz["c_c2w"] = (lz["c_c2w"] - c0) @ R_f.T + c0
+        lz["cam_pos"] = R_f @ (lz["cam_pos"] - c0) + c0
+        if "R_cam2world" in lz:
+            lz["R_cam2world"] = R_f @ lz["R_cam2world"]
+        np.savez_compressed(LIFT_NPZ, **lz)
+        print(f"[fit] up unify: correction exported back to {os.path.basename(LIFT_NPZ)}")
 
 
 if __name__ == "__main__":
