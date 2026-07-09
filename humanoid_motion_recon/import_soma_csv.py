@@ -26,6 +26,31 @@ inp, outp = sys.argv[1], sys.argv[2]
 seq = sys.argv[3] if len(sys.argv) > 3 else "xyz"
 
 raw = np.genfromtxt(inp, delimiter=",", skip_header=1)
+
+# branch-hop repair: the retargeter's per-frame LM IK occasionally hops between redundant
+# arm/waist solution branches (1-5 frame events). Detect angular-velocity spikes per DOF
+# and bridge them by linear interpolation from the surrounding clean frames.
+if os.environ.get("FIX_HOPS", "1") != "0":
+    fps_in = float(os.environ.get("SRC_FPS", "120")) or 120.0
+    fixed = 0
+    for c in range(7, 36):
+        v = raw[:, c]
+        dv = np.abs(np.diff(v)) * fps_in
+        bad = np.zeros(len(v), bool)
+        bad[1:] |= dv > 400.0
+        bad[:-1] |= dv > 400.0
+        idx = np.flatnonzero(bad)
+        if len(idx) == 0 or len(idx) > 0.2 * len(v):
+            continue
+        for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1):
+            lo, hi = max(r[0] - 1, 0), min(r[-1] + 1, len(v) - 1)
+            if hi - lo < 2 or hi - lo > int(0.25 * fps_in):
+                continue
+            v[lo + 1:hi] = np.linspace(v[lo], v[hi], hi - lo + 1)[1:-1]
+            fixed += 1
+    if fixed:
+        print(f"[csv2qpos] bridged {fixed} IK branch-hop runs")
+
 SRC, DST = float(os.environ.get("SRC_FPS", "0")), float(os.environ.get("DST_FPS", "0"))
 if SRC and DST and abs(SRC - DST) > 1e-3:
     t_src = np.arange(len(raw)) / SRC

@@ -177,6 +177,44 @@ def main():
             if not m.all():
                 Jw[:, j, c] = np.interp(np.arange(T), np.flatnonzero(m), v[m])
 
+    # temporal smoothing (the corrected mocap is raw per-frame articulation; our own
+    # retarget smooths AFTER IK in qpos space - this path must smooth the input instead)
+    if os.environ.get("MR_SMOOTH", "1") != "0":
+        k = max(3, 2 * int(round(0.10 * FPS / 2)) + 1)   # ~0.2 s box, odd
+        pad = np.pad(Jw, ((k // 2, k // 2), (0, 0), (0, 0)), mode="edge")
+        Jw = np.stack([pad[i:i + len(Jw)] for i in range(k)], 0).mean(0)
+
+    # planted-foot clamp: the fit's heels drift up several cm during bends (kappa artifact);
+    # the retargeter's feet stabilizer pins contacts and fights the floating targets, which
+    # shows up as sitting-back crouches. Pin each foot's height to its planted level over
+    # stationary runs (our qpos pipeline does the same via ground_clamp before rendering).
+    for ank, toe, heel in (("lank", "lbtoe", "lheel"), ("rank", "rbtoe", "rheel")):
+        a = Jw[:, I[ank]]
+        v = np.zeros(len(a))
+        v[1:] = np.linalg.norm(np.diff(a[:, :2], axis=0), axis=1) * FPS
+        vk = max(3, 2 * int(round(0.1 * FPS / 2)) + 1)
+        v = np.convolve(np.pad(v, (vk // 2, vk // 2), mode="edge"), np.ones(vk) / vk, "valid")
+        z_lo = np.nanpercentile(a[:, 2], 20)
+        planted = (v < 0.25) & (a[:, 2] < z_lo + 0.10)
+        idx = np.flatnonzero(planted)
+        if len(idx):
+            runs = [r for r in np.split(idx, np.flatnonzero(np.diff(idx) > 1) + 1)
+                    if len(r) >= int(0.2 * FPS)]
+            # one baseline per foot joint: all planted runs sit at the foot's ground level
+            # (a run's own median would pin bend-phase heel FLOAT in place)
+            base = {jn: float(np.percentile(Jw[np.concatenate(runs), I[jn], 2], 20))
+                    for jn in (ank, toe, heel)} if runs else {}
+            for r in runs:
+                for jn in (ank, toe, heel):
+                    zmed = base[jn]
+                    Jw[r, I[jn], 2] = zmed
+                    for e, drn in ((r[0], -1), (r[-1], +1)):   # short blend at run edges
+                        for b in range(1, int(0.1 * FPS) + 1):
+                            t_ = e + drn * b
+                            if 0 <= t_ < len(Jw) and not planted[min(max(t_, 0), len(Jw) - 1)]:
+                                w = 1.0 - b / (int(0.1 * FPS) + 1)
+                                Jw[t_, I[jn], 2] = w * zmed + (1 - w) * Jw[t_, I[jn], 2]
+
     if FPS_OUT and abs(FPS_OUT - FPS) > 1e-3:            # resample to the retargeter fps
         t_src = np.arange(T) / FPS
         t_dst = np.arange(int(t_src[-1] * FPS_OUT) + 1) / FPS_OUT
@@ -213,11 +251,43 @@ def main():
     # Children with no own direction target (Hand, ToeBase) ride the parent's delta.
     def ref_anchor(joint, child, b):
         d_ref = Gr[joint] @ u(off[child])
+        b = unit(b)
         delta = minrot(np.tile(d_ref, (T, 1)), b)
+        # minrot's axis is unstable when d_meas is near-antipodal to d_ref (arms reaching
+        # up vs a hanging reference). There, use frame-to-frame transported deltas (always
+        # well-conditioned) and blend by angle; direct minrot keeps zero long-term drift.
+        ang = np.degrees(np.arccos(np.clip(b @ d_ref, -1, 1)))
+        if ang.max() > 120.0:
+            step = minrot(b[:-1], b[1:])
+            trans = np.empty_like(delta)
+            trans[0] = delta[0]
+            for t_ in range(1, T):
+                trans[t_] = step[t_ - 1] @ trans[t_ - 1]
+            w = np.clip((ang - 120.0) / 40.0, 0.0, 1.0)[:, None, None]
+            R9 = (1 - w) * delta + w * trans             # blend + project back to SO(3)
+            U, _, Vt = np.linalg.svd(R9)
+            det = np.linalg.det(U @ Vt)
+            Vt[:, -1, :] *= np.sign(det)[:, None]
+            delta = U @ Vt
         return delta, np.einsum("nij,jk->nik", delta, Gr[joint])
     for S_, sh, el, wr in (("Left", "lsho", "lelb", "lwri"), ("Right", "rsho", "relb", "rwri")):
-        _, G[S_ + "Arm"] = ref_anchor(S_ + "Arm", S_ + "ForeArm", d(sh, el))
-        dfa, G[S_ + "ForeArm"] = ref_anchor(S_ + "ForeArm", S_ + "Hand", d(el, wr))
+        dua, G[S_ + "Arm"] = ref_anchor(S_ + "Arm", S_ + "ForeArm", d(sh, el))
+        # elbow-bend floor: a fully straight arm makes the IK's elbow branch degenerate
+        # (the retargeter hops elbow-up/elbow-down frame to frame). Keep >= ~10 deg of
+        # bend by rotating the forearm direction about the transported reference elbow
+        # hinge axis - visually invisible, kills the branch ambiguity at the source.
+        d_ua, d_fa = unit(d(sh, el)), unit(d(el, wr))
+        hinge_ref = u(np.cross(Gr[S_ + "Arm"] @ off[S_ + "ForeArm"],
+                               Gr[S_ + "ForeArm"] @ off[S_ + "Hand"]))
+        hinge = unit(np.einsum("nij,j->ni", dua, hinge_ref))
+        bend = np.degrees(np.arccos(np.clip(np.einsum("ni,ni->n", d_ua, d_fa), -1, 1)))
+        need = np.clip(10.0 - bend, 0.0, None)
+        m_st = need > 0
+        if m_st.any():
+            ax = hinge[m_st] * np.radians(need[m_st])[:, None]
+            d_fa[m_st] = np.einsum("nij,nj->ni",
+                                   Rotation.from_rotvec(ax).as_matrix(), d_fa[m_st])
+        dfa, G[S_ + "ForeArm"] = ref_anchor(S_ + "ForeArm", S_ + "Hand", d_fa)
         G[S_ + "Hand"] = np.einsum("nij,jk->nik", dfa, Gr[S_ + "Hand"])
     for S_, hp, kn, an, to in (("Left", "lhip", "lkne", "lank", "lbtoe"),
                                ("Right", "rhip", "rkne", "rank", "rbtoe")):
