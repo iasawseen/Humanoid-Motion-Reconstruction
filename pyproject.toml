@@ -1,5 +1,5 @@
 [project]
-name = "humanoid-motion-recon"
+name = "humanoid-motion-reconstruction"
 version = "0.1.0"
 description = "Monocular video -> world-frame humanoid skeletons + meshes (SAM-3D-Body + VGGT-Omega + rigid fitting)"
 requires-python = ">=3.10"

@@ -1,4 +1,6 @@
-# humanoid_motion_recon
+# humanoid-motion-reconstruction
+
+Python import package: `humanoid_motion_recon` (repo name is hyphenated, imports cannot be).
 
 Monocular RGB video → **world-frame humanoid skeletons + meshes**. Combines
 [SAM-3D-Body](https://github.com/facebookresearch/sam-3d-body) (per-frame MHR keypoints,
