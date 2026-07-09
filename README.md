@@ -110,10 +110,23 @@ SOMA Hips joint sits ~8.5 cm above the hip line, and conflating them inflates th
 Scale + floor are self-measured from the fit. **Chirality**: fit3d articulation carries
 SAM's smoothed-in mirror flickers; for flicker-prone clips pass `MR_MOCAP_NPZ` (npz with
 chirality-corrected `mocap` [N,58,3] + `ok`, e.g. from a hypothesis-selection + Viterbi
-pass) or the retargeted robot pivots ~180 deg on mirrored stretches. `import_soma_csv`
-undoes their "Mujoco"-facing world convention (BVH +Z forward lands on -Y; we yaw it back
-to +X) and converts cm/degrees to m/radians (their extrinsic-xyz root euler, G1 DOF order
-identical to the g1.xml hinge order).
+pass) or the retargeted robot pivots ~180 deg on mirrored stretches. **Twist**: limb
+segment frames are built rig-exact from two measured vectors per segment - bone direction
+(matched exactly) + bend axis (cross of adjacent bone directions; fixes the twist) - which
+is the SOMA rig's own convention (segment-local +Z = bend axis; NVIDIA's sample clips have
+ForeArm/Shin locals as exact pure positive-Z hinges) and heading-correct by construction.
+Never anchor limb twist to the template's world heading (minrot transport or world-anchored
+mesh deltas): a subject facing away from the template's +Z carries ~180 deg of twist on
+every limb link, which the retargeter's orientation objectives turn into railed hip and
+shoulder yaws and permanently bent knees - while position-based evals stay blind to it.
+If `MR_MOCAP_NPZ` also carries `rots_w` [N,J,3,3] + `rot_names` + `ref_n` (world-frame
+mesh-rig segment rotations, e.g. SAM-3D-Body `joint_global_rots` after camera-convention
+conjugation and chirality correction), wrist pronation is taken from the mesh as a twist
+about the forearm axis. Measured on a fast-turn clip: NV retarget 16.0 -> 8.0 cm local
+MPJPE, heading mean 8.4 -> 2.4 deg, all joint-limit railing gone.
+`import_soma_csv` undoes their "Mujoco"-facing world convention (BVH +Z forward lands on
+-Y; we yaw it back to +X) and converts cm/degrees to m/radians (their extrinsic-xyz root
+euler, G1 DOF order identical to the g1.xml hinge order).
 
 ## Visualization / QA renderers
 

@@ -13,8 +13,13 @@ whole robot), the mid-hip <-> Hips-joint offset (the SOMA Hips joint sits ~8.5 c
 hip line; conflating them inflates the skeleton ~9% and makes the retargeter crouch), and
 the local rotations of all untracked joints (neck chain, clavicles, fingers) which keep the
 reference frame's natural posture instead of zeros. Direction transfer: two-vector Kabsch
-frames for Hips/Chest, slerp for Spine1/2, minimal rotations for limb bones (wrist/toe
-follow their parent).
+frames for Hips/Chest, slerp for Spine1/2, and rig-exact two-vector frames for every limb
+segment (measured bone direction + measured bend axis; the SOMA rig's convention is
+segment-local +Z = bend axis, bone = +/-X - NVIDIA's own clips carry ForeArm/Shin locals
+as exact pure positive-Z hinges). Twist anchored to the template's world heading (minrot
+transport / world-anchored mesh deltas) is poison: it rails the retargeter's hip/shoulder
+yaws for subjects facing away from the template. When MR_MOCAP_NPZ carries `rots_w`
+(+ `rot_names`/`ref_n`), wrist pronation is taken from the mesh.
 
 Scale + floor are self-measured from the fit (pelvis-plateau -> template reference mid-hip
 height; lower-heel p5 -> y=0), so any scenario calibration convention works.
@@ -167,9 +172,20 @@ def main():
     else:
         fz = np.load(os.path.join(outd, "fit3d.npz"))
         Jw, ok = fz["joints_w"][:, :18].astype(np.float64), fz["ok"].astype(bool)
+    # MHR segment rotations (world, chirality-corrected; saved by the retarget pass): the
+    # TWIST source. Bone directions alone cannot see twist about the bone - without these,
+    # limb twist, palm and head orientation stay at the template's reference values.
+    Rw, RN, ref_n = None, {}, 0
+    if "rots_w" in fz.files:
+        Rw = fz["rots_w"].astype(np.float64)
+        RN = {str(n): i for i, n in enumerate(fz["rot_names"])}
+        ref_n = int(fz["ref_n"])
+        print(f"[bvh] MHR rotation twist source: {len(RN)} joints, anchor frame {ref_n}")
     first, last = np.flatnonzero(ok)[0], np.flatnonzero(ok)[-1]
     Jw = Jw[first:last + 1]
     T = len(Jw)
+    if Rw is not None:
+        Rw = Rw[first:last + 1]
     for j in range(18):                                  # interpolate interior gaps
         for c in range(3):
             v = Jw[:, j, c]
@@ -220,7 +236,13 @@ def main():
         t_dst = np.arange(int(t_src[-1] * FPS_OUT) + 1) / FPS_OUT
         Jw = np.stack([[np.interp(t_dst, t_src, Jw[:, j, c]) for c in range(3)]
                        for j in range(18)], 0).transpose(2, 0, 1)
+        if Rw is not None:
+            Rw = np.stack([Slerp(t_src, Rotation.from_matrix(Rw[:, j]))(t_dst).as_matrix()
+                           for j in range(Rw.shape[1])], 1)
         T = len(Jw)
+    # rotation-anchor frame index in the (trimmed, resampled) timebase
+    ref_i = int(np.clip(round((ref_n - first) / FPS * FPS_OUT), 0, T - 1)) \
+        if FPS_OUT and abs(FPS_OUT - FPS) > 1e-3 else int(np.clip(ref_n - first, 0, T - 1))
 
     # self-measured scale (pelvis plateau -> template reference MID-HIP height, not the
     # Hips joint - it sits ~8.5 cm higher) + floor re-anchor
@@ -245,56 +267,80 @@ def main():
     G["Chest"] = frame_align(a_sp_chest, a_sl_chest, unit(spine), unit(sholine))
     G["Spine1"] = slerp_batch(G["Hips"], G["Chest"], 1 / 3)
     G["Spine2"] = slerp_batch(G["Hips"], G["Chest"], 2 / 3)
-    # limbs: reference-anchored direction transfer. G = minrot(d_ref -> d_meas) @ G_ref
-    # keeps the reference frame's anatomical TWIST (the rig's zero orientation has none -
-    # anchoring there scrambles hip yaw ~150 deg, and the retargeter reads link rotations).
-    # Children with no own direction target (Hand, ToeBase) ride the parent's delta.
-    def ref_anchor(joint, child, b):
-        d_ref = Gr[joint] @ u(off[child])
-        b = unit(b)
-        delta = minrot(np.tile(d_ref, (T, 1)), b)
-        # minrot's axis is unstable when d_meas is near-antipodal to d_ref (arms reaching
-        # up vs a hanging reference). There, use frame-to-frame transported deltas (always
-        # well-conditioned) and blend by angle; direct minrot keeps zero long-term drift.
-        ang = np.degrees(np.arccos(np.clip(b @ d_ref, -1, 1)))
-        if ang.max() > 120.0:
-            step = minrot(b[:-1], b[1:])
-            trans = np.empty_like(delta)
-            trans[0] = delta[0]
-            for t_ in range(1, T):
-                trans[t_] = step[t_ - 1] @ trans[t_ - 1]
-            w = np.clip((ang - 120.0) / 40.0, 0.0, 1.0)[:, None, None]
-            R9 = (1 - w) * delta + w * trans             # blend + project back to SO(3)
-            U, _, Vt = np.linalg.svd(R9)
-            det = np.linalg.det(U @ Vt)
-            Vt[:, -1, :] *= np.sign(det)[:, None]
-            delta = U @ Vt
-        return delta, np.einsum("nij,jk->nik", delta, Gr[joint])
+    # ---- limb segment frames: rig-exact two-vector construction.
+    # HARD RIG CONVENTION (verified on the template reference and all 10 NVIDIA sample
+    # clips: measured bend axis . segment-local +Z = +1.000; their ForeArm/Shin locals
+    # are EXACT pure positive-Z hinges, off-axis 0.00): every limb segment has local
+    # +Z = bend axis (positive flexion) and local +/-X = bone. Each segment frame is
+    # therefore fully determined by the MEASURED bone direction + MEASURED bend axis -
+    # heading-correct by construction. (The previous minrot transport pinned segment
+    # twist to the template's +Z facing: a subject standing 180 deg from it carried
+    # ~180 deg of twist on every limb link, which the retargeter's orientation
+    # objectives - hand r=1.2, foot r=2.0 + FeetStabilizer at 1.0 - turned into railed
+    # hip/shoulder yaws, frozen ankles and permanently bent knees, all pinned at exact
+    # g1 limits by their joint_limit clamper from frame 0.)
+    # Straight limbs have no measurable bend axis: blend toward the torso-riding
+    # template axis (heading-aligned via the measured Hips/Chest frames) by bend angle.
+    EZ = np.array([0.0, 0.0, 1.0])
+    D_hips = np.einsum("nij,kj->nik", G["Hips"], Gr["Hips"])
+    D_chest = np.einsum("nij,kj->nik", G["Chest"], Gr["Chest"])
+
+    def bend_axis(d_par, d_chi, seg, D_T):
+        ax = np.cross(d_par, d_chi)
+        s = np.linalg.norm(ax, axis=1)
+        bend = np.degrees(np.arcsin(np.clip(s, 0.0, 1.0)))
+        ax_fb = np.einsum("nij,j->ni", D_T, Gr[seg] @ EZ)
+        w = np.clip(bend / 15.0, 0.0, 1.0)[:, None]
+        ax_m = np.where(s[:, None] > 1e-8, ax / np.maximum(s, 1e-9)[:, None], ax_fb)
+        return unit(w * ax_m + (1.0 - w) * ax_fb)
+
+    # mesh wrist pronation (the one twist DOF bend-axis frames cannot see): twist of the
+    # mesh wrist-vs-forearm delta about the forearm bone axis, relative to REF
+    def pronation(p_):
+        if Rw is None or (p_ + "wri") not in RN or (p_ + "_forearm") not in RN:
+            return None
+        jf, jw = RN[p_ + "_forearm"], RN[p_ + "wri"]
+        R_rel = np.einsum("nji,njk->nik", Rw[:, jf], Rw[:, jw])   # forearm-local wrist
+        dR = np.einsum("nij,kj->nik", R_rel, R_rel[ref_i])
+        el, wr = ("lelb", "lwri") if p_ == "l" else ("relb", "rwri")
+        a = Jw[ref_i, I[wr]] - Jw[ref_i, I[el]]
+        a = Rw[ref_i, jf].T @ (a / np.linalg.norm(a))             # bone axis, forearm-local
+        qq = Rotation.from_matrix(dR).as_quat()                   # [T,4] xyzw
+        tw = 2.0 * np.arctan2(qq[:, :3] @ a, qq[:, 3])
+        return (tw + np.pi) % (2 * np.pi) - np.pi
+
     for S_, sh, el, wr in (("Left", "lsho", "lelb", "lwri"), ("Right", "rsho", "relb", "rwri")):
-        dua, G[S_ + "Arm"] = ref_anchor(S_ + "Arm", S_ + "ForeArm", d(sh, el))
+        p_ = S_[0].lower()
+        d_ua, d_fa = unit(d(sh, el)), unit(d(el, wr))
+        ax = bend_axis(d_ua, d_fa, S_ + "Arm", D_chest)
         # elbow-bend floor: a fully straight arm makes the IK's elbow branch degenerate
         # (the retargeter hops elbow-up/elbow-down frame to frame). Keep >= ~10 deg of
-        # bend by rotating the forearm direction about the transported reference elbow
-        # hinge axis - visually invisible, kills the branch ambiguity at the source.
-        d_ua, d_fa = unit(d(sh, el)), unit(d(el, wr))
-        hinge_ref = u(np.cross(Gr[S_ + "Arm"] @ off[S_ + "ForeArm"],
-                               Gr[S_ + "ForeArm"] @ off[S_ + "Hand"]))
-        hinge = unit(np.einsum("nij,j->ni", dua, hinge_ref))
+        # bend by rotating the forearm direction about the bend axis.
         bend = np.degrees(np.arccos(np.clip(np.einsum("ni,ni->n", d_ua, d_fa), -1, 1)))
         need = np.clip(10.0 - bend, 0.0, None)
         m_st = need > 0
         if m_st.any():
-            ax = hinge[m_st] * np.radians(need[m_st])[:, None]
+            rv = ax[m_st] * np.radians(need[m_st])[:, None]
             d_fa[m_st] = np.einsum("nij,nj->ni",
-                                   Rotation.from_rotvec(ax).as_matrix(), d_fa[m_st])
-        dfa, G[S_ + "ForeArm"] = ref_anchor(S_ + "ForeArm", S_ + "Hand", d_fa)
-        G[S_ + "Hand"] = np.einsum("nij,jk->nik", dfa, Gr[S_ + "Hand"])
+                                   Rotation.from_rotvec(rv).as_matrix(), d_fa[m_st])
+        G[S_ + "Arm"] = frame_align(u(off[S_ + "ForeArm"]), EZ, d_ua, ax)
+        G[S_ + "ForeArm"] = frame_align(u(off[S_ + "Hand"]), EZ, d_fa, ax)
+        G[S_ + "Hand"] = np.einsum("nij,jk->nik", G[S_ + "ForeArm"],
+                                   Gr[S_ + "ForeArm"].T @ Gr[S_ + "Hand"])
+        tw = pronation(p_)
+        if tw is not None:
+            Rtw = Rotation.from_rotvec(d_fa * tw[:, None]).as_matrix()
+            G[S_ + "Hand"] = np.einsum("nij,njk->nik", Rtw, G[S_ + "Hand"])
     for S_, hp, kn, an, to in (("Left", "lhip", "lkne", "lank", "lbtoe"),
                                ("Right", "rhip", "rkne", "rank", "rbtoe")):
-        _, G[S_ + "Leg"] = ref_anchor(S_ + "Leg", S_ + "Shin", d(hp, kn))
-        _, G[S_ + "Shin"] = ref_anchor(S_ + "Shin", S_ + "Foot", d(kn, an))
-        dft, G[S_ + "Foot"] = ref_anchor(S_ + "Foot", S_ + "ToeBase", d(an, to))
-        G[S_ + "ToeBase"] = np.einsum("nij,jk->nik", dft, Gr[S_ + "ToeBase"])
+        d_th, d_sh, d_ft = unit(d(hp, kn)), unit(d(kn, an)), unit(d(an, to))
+        axk = bend_axis(d_th, d_sh, S_ + "Leg", D_hips)
+        G[S_ + "Leg"] = frame_align(u(off[S_ + "Shin"]), EZ, d_th, axk)
+        G[S_ + "Shin"] = frame_align(u(off[S_ + "Foot"]), EZ, d_sh, axk)
+        axf = unit(axk - np.einsum("ni,ni->n", axk, d_ft)[:, None] * d_ft)
+        G[S_ + "Foot"] = frame_align(u(off[S_ + "ToeBase"]), EZ, d_ft, axf)
+        G[S_ + "ToeBase"] = np.einsum("nij,jk->nik", G[S_ + "Foot"],
+                                      Gr[S_ + "Foot"].T @ Gr[S_ + "ToeBase"])
 
     # untracked joints (Root, neck chain, clavicles, fingers, toes-ends, eyes/jaw) keep the
     # reference frame's LOCAL rotations - the natural posture the retargeter was tuned on
