@@ -105,11 +105,21 @@ python -m humanoid_motion_recon.import_soma_csv out.csv qpos.csv          # CSV 
 ```
 
 `export_soma_bvh` copies the template hierarchy verbatim from a sample BVH in their checkout
-and calibrates all anatomy conventions from that sample's standing reference frame (spine /
-hip-line directions in the Hips/Chest local frames, the mid-hip to Hips-joint offset — the
-SOMA Hips joint sits ~8.5 cm above the hip line, and conflating them inflates the skeleton
-~9% and makes the retargeter crouch — and natural local rotations for untracked joints).
-Scale + floor are self-measured from the fit. **Chirality**: fit3d articulation carries
+and calibrates limb rest anatomy from that sample's standing reference frame (plus the
+mid-hip to Hips-joint offset — the SOMA Hips joint sits ~8.5 cm above the hip line, and
+conflating them inflates the skeleton ~9% and makes the retargeter crouch — and natural
+local rotations for untracked joints). **Torso** anchors (spine / hip-line in the
+Hips/Chest local frames) come from `soma_zero_frame0.bvh` instead — the pose the
+retargeter's joint_offsets are calibrated against; a motion sample's own sacral tilt
+(pelvis ~7°, chest ~13° forward vs zero) otherwise rides into every subject and the robots
+stand pitched forward. The measured spine line is shoulders-mid − mid-hip (SAM's neck
+keypoint sits at the throat, ~2.6° forward), and the PELVIS anchor uses a tilt-reduced
+spine (`MR_PELVIS_BEND_FRAC`, default 0.35 — in their own mocap the Hips pitches only ~1/3
+of the spine line; the chest keeps the full spine). Scale + floor are self-measured from
+the fit; after their retargeter, ground the imported qpos with
+`python -m humanoid_motion_recon.ground_qpos in.csv out.csv` (`ROBOT_XML` env) — their
+scaler leaves planted soles hovering a constant few cm (up to ~20 cm for tall subjects)
+above z=0. **Chirality**: fit3d articulation carries
 SAM's smoothed-in mirror flickers; for flicker-prone clips pass `MR_MOCAP_NPZ` (npz with
 chirality-corrected `mocap` [N,58,3] + `ok`, e.g. from a hypothesis-selection + Viterbi
 pass) or the retargeted robot pivots ~180 deg on mirrored stretches. **Twist**: limb

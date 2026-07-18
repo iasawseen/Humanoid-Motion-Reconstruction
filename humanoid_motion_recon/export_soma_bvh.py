@@ -112,7 +112,7 @@ def parse_template(path):
             stack.append(joints[-1][0] if joints else None)
         elif t == "}":
             stack.pop()
-    ref_row = np.array(list(map(float, mot.strip().splitlines()[3].split())))
+    ref_row = np.array(list(map(float, mot.strip().splitlines()[2].split())))
     return hier, [(n, p, o, c) for n, p, o, c in joints], ref_row
 
 
@@ -153,11 +153,25 @@ def main():
     midhip_r = 0.5 * (Pr["LeftLeg"] + Pr["RightLeg"])
     # anatomy in local frames at the reference: spine/hip-line in Hips, spine/shoulder-line
     # in Chest, and the constant mid-hip -> Hips-joint offset (in the Hips local frame)
-    a_sp_hips = Gr["Hips"].T @ u(Pr["Neck1"] - midhip_r)
-    a_hl_hips = Gr["Hips"].T @ u(Pr["LeftLeg"] - Pr["RightLeg"])
-    a_sp_chest = Gr["Chest"].T @ u(Pr["Neck1"] - midhip_r)
-    a_sl_chest = Gr["Chest"].T @ u(Pr["LeftArm"] - Pr["RightArm"])
-    v_mh_local = Gr["Hips"].T @ (Pr["Hips"] - midhip_r)
+    # TORSO anchors come from the CALIBRATION pose (soma_zero_frame0.bvh), not the walk
+    # reference: the retargeter's joint_offsets are defined against the zero pose, and the
+    # walk reference's own sacral tilt (pelvis ~7 deg, chest ~13 deg of forward pitch vs
+    # zero) otherwise rides into every subject on top of their real lean - the retargeted
+    # robots stood pitched ~15-20 deg forward of the person. Limb rest anatomy (below)
+    # stays on the walk reference: the rig-exact limb frames are calibrated against it.
+    zpath = os.path.join(srd, "soma_retargeter/configs/soma/soma_zero_frame0.bvh")
+    _, joints0, row0 = parse_template(zpath)
+    Gr0, Pr0, _ = fk_reference(joints0, row0)
+    midhip_0 = 0.5 * (Pr0["LeftLeg"] + Pr0["RightLeg"])
+    a_sp_hips = Gr0["Hips"].T @ u(Pr0["Neck1"] - midhip_0)
+    a_hl_hips = Gr0["Hips"].T @ u(Pr0["LeftLeg"] - Pr0["RightLeg"])
+    a_sp_chest = Gr0["Chest"].T @ u(Pr0["Neck1"] - midhip_0)
+    a_sl_chest = Gr0["Chest"].T @ u(Pr0["LeftArm"] - Pr0["RightArm"])
+    # mid-hip -> Hips offset: zero-pose DIRECTION (pairs with the zero-anchored Hips
+    # frame), walk-rig LENGTH (the output BVH carries the walk rig's proportions)
+    v_mh_local = Gr0["Hips"].T @ (Pr0["Hips"] - midhip_0)
+    v_mh_local *= np.linalg.norm(Pr["Hips"] - midhip_r) / \
+        max(np.linalg.norm(Pr0["Hips"] - midhip_0), 1e-9)
 
     outd = os.environ.get("MR_OUT", "mr_out")
     # fit3d articulation carries SAM's front/back mirror flickers smoothed in - fine for
@@ -260,10 +274,28 @@ def main():
     midhip = 0.5 * (J[:, I["lhip"]] + J[:, I["rhip"]])
     hipline = J[:, I["lhip"]] - J[:, I["rhip"]]
     sholine = J[:, I["lsho"]] - J[:, I["rsho"]]
-    spine = J[:, I["neck"]] - midhip
+    # shoulders-mid, not the SAM neck keypoint: the neck kp sits at the throat, ~2.6 deg
+    # forward of the anatomical spine line at stand (the template Neck1 is a spine joint)
+    spine = 0.5 * (J[:, I["lsho"]] + J[:, I["rsho"]]) - midhip
 
+    # the real SOMA Hips pitches only a fraction of the spine line (their own mocap:
+    # pelvis 2-21 deg where the spine tilts 1-62 - lumbar bend mostly lives in the
+    # spine chain, not the pelvis). A 1:1 spine-mapped pelvis over-pitches the robots
+    # at stand and doubles down in bends. Anchor the PELVIS to a tilt-reduced spine
+    # (rotate the measured spine toward vertical by (1-frac) of its tilt, about the
+    # horizontal axis - heading and roll stay measured via the hip-line); the CHEST
+    # keeps the full measured spine.
+    frac = float(os.environ.get("MR_PELVIS_BEND_FRAC", "0.35"))
+    sp_u = unit(spine)
+    ct = np.clip(sp_u[:, 1], -1.0, 1.0)                  # BVH frame: +Y is up
+    th = np.arccos(ct) * (1.0 - frac)                    # tilt to remove
+    ax = np.cross(sp_u, np.array([0.0, 1.0, 0.0]))
+    s_ = np.linalg.norm(ax, axis=1)
+    ax = np.where(s_[:, None] > 1e-8, ax / np.maximum(s_, 1e-9)[:, None],
+                  np.array([1.0, 0.0, 0.0]))
+    sp_ped = Rotation.from_rotvec(ax * th[:, None]).apply(sp_u)
     G = {}
-    G["Hips"] = frame_align(a_sp_hips, a_hl_hips, unit(spine), unit(hipline))
+    G["Hips"] = frame_align(a_sp_hips, a_hl_hips, unit(sp_ped), unit(hipline))
     G["Chest"] = frame_align(a_sp_chest, a_sl_chest, unit(spine), unit(sholine))
     G["Spine1"] = slerp_batch(G["Hips"], G["Chest"], 1 / 3)
     G["Spine2"] = slerp_batch(G["Hips"], G["Chest"], 2 / 3)
@@ -282,8 +314,8 @@ def main():
     # Straight limbs have no measurable bend axis: blend toward the torso-riding
     # template axis (heading-aligned via the measured Hips/Chest frames) by bend angle.
     EZ = np.array([0.0, 0.0, 1.0])
-    D_hips = np.einsum("nij,kj->nik", G["Hips"], Gr["Hips"])
-    D_chest = np.einsum("nij,kj->nik", G["Chest"], Gr["Chest"])
+    D_hips = np.einsum("nij,kj->nik", G["Hips"], Gr0["Hips"])
+    D_chest = np.einsum("nij,kj->nik", G["Chest"], Gr0["Chest"])
 
     def bend_axis(d_par, d_chi, seg, D_T):
         ax = np.cross(d_par, d_chi)
